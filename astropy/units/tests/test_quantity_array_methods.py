@@ -5,9 +5,7 @@ import numpy as np
 
 from ... import units as u
 from ...tests.helper import pytest
-
-NUMPY_LT_1P7 = [int(x) for x in np.__version__.split('.')[:2]] < [1, 7]
-NUMPY_LT_1P8 = [int(x) for x in np.__version__.split('.')[:2]] < [1, 8]
+from ...utils.compat import NUMPY_LT_1_7, NUMPY_LT_1_8, NUMPY_LT_1_9_1
 
 
 class TestQuantityArrayCopy(object):
@@ -144,14 +142,15 @@ class TestQuantityStatsFuncs(object):
         q1 = np.array([1., 2.]) * u.m
         assert np.std(q1) == 0.5 * u.m
 
+    # For 1.7 <= Numpy < 1.9.1, inplace causes the variance to be stored instead
+    # of the standard deviation; https://github.com/numpy/numpy/issues/5240
+    @pytest.mark.xfail("NUMPY_LT_1_9_1")
     def test_std_inplace(self):
 
-        # For Numpy >= 1.7, inplace causes the variance to be stored instead
-        # of the standard deviation.
-        # see https://github.com/numpy/numpy/issues/5240
-        # For Numpy < 1.7, the test segfaults.  Hence, we cannot use the xfail
-        # decorator since py.test will run the test anyway to see if it works.
-        pytest.xfail()
+        # For Numpy < 1.7, the test segfaults.  Hence, the xfail decorator does
+        # not suffice: py.test will run the test anyway to see if it works.
+        if NUMPY_LT_1_7:
+            pytest.xfail()
 
         q1 = np.array([1., 2.]) * u.m
         qi = 1.5 * u.s
@@ -166,7 +165,7 @@ class TestQuantityStatsFuncs(object):
 
         # For Numpy < 1.7, the test segfaults.  Hence, we cannot use the xfail
         # decorator since py.test will run the test anyway to see if it works.
-        if NUMPY_LT_1P7:
+        if NUMPY_LT_1_7:
             pytest.xfail()
 
         q1 = np.array([1., 2.]) * u.m
@@ -299,7 +298,7 @@ class TestQuantityStatsFuncs(object):
         assert np.all(q2.nansum(0) == np.array([1., 5., 10.]) * u.s)
         assert np.all(np.nansum(q2, 0) == np.array([1., 5., 10.]) * u.s)
 
-    @pytest.mark.xfail("NUMPY_LT_1P8")
+    @pytest.mark.xfail("NUMPY_LT_1_8")
     def test_nansum_inplace(self):
 
         q1 = np.array([1., 2., np.nan]) * u.m

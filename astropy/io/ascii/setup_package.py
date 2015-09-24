@@ -1,4 +1,5 @@
 # Licensed under a 3-clause BSD style license
+from __future__ import absolute_import
 
 import os
 from distutils.extension import Extension
@@ -47,6 +48,7 @@ def get_package_data():
                                    't/html2.html',
                                    't/ipac.dat',
                                    't/ipac.dat.bz2',
+                                   't/ipac.dat.xz',
                                    't/latex1.tex',
                                    't/latex1.tex.gz',
                                    't/latex2.tex',
@@ -60,6 +62,7 @@ def get_package_data():
                                    't/short.rdb',
                                    't/short.rdb.bz2',
                                    't/short.rdb.gz',
+                                   't/short.rdb.xz',
                                    't/short.tab',
                                    't/simple.txt',
                                    't/simple2.txt',
@@ -75,6 +78,7 @@ def get_package_data():
                                    't/whitespace.dat',
                                    't/simple_csv.csv',
                                    't/simple_csv_missing.csv',
+                                   't/fixed_width_2_line.txt',
                                    ]
     }
 

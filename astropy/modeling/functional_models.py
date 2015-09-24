@@ -5,26 +5,28 @@
 from __future__ import (absolute_import, unicode_literals, division,
                         print_function)
 
-import collections
 import inspect
-
-from textwrap import dedent
 
 import numpy as np
 
 from .core import (Fittable1DModel, Fittable2DModel, Model,
                    ModelDefinitionError, custom_model)
 from .parameters import Parameter, InputParameterError
+from .utils import ellipse_extent
 from ..utils import deprecated
+from ..utils.compat.funcsigs import signature
 from ..extern import six
 
+from .utils import get_inputs_and_params
+
+
 __all__ = sorted([
-    'AiryDisk2D', 'Beta1D', 'Beta2D', 'Box1D',
-    'Box2D', 'Const1D', 'Const2D', 'Disk2D',
+    'AiryDisk2D', 'Moffat1D', 'Moffat2D', 'Box1D',
+    'Box2D', 'Const1D', 'Const2D', 'Ellipse2D', 'Disk2D',
     'Gaussian1D', 'GaussianAbsorption1D', 'Gaussian2D', 'Linear1D',
-    'Lorentz1D', 'MexicanHat1D', 'MexicanHat2D', 'Scale', 'Redshift', 'Shift',
-    'Sine1D', 'Trapezoid1D', 'TrapezoidDisk2D', 'Ring2D',
-    'custom_model_1d'
+    'Lorentz1D', 'MexicanHat1D', 'MexicanHat2D', 'Redshift', 'Scale',
+    'Sersic1D', 'Sersic2D', 'Shift', 'Sine1D', 'Trapezoid1D', 'TrapezoidDisk2D',
+    'Ring2D', 'custom_model_1d', 'Voigt1D'
 ])
 
 
@@ -88,16 +90,44 @@ class Gaussian1D(Fittable1DModel):
 
     See Also
     --------
-    Gaussian2D, Box1D, Beta1D, Lorentz1D
+    Gaussian2D, Box1D, Moffat1D, Lorentz1D
     """
 
-    amplitude = Parameter()
-    mean = Parameter()
-    stddev = Parameter()
+    amplitude = Parameter(default=1)
+    mean = Parameter(default=0)
+    stddev = Parameter(default=1)
+    _bounding_box = 'auto'
 
-    def __init__(self, amplitude, mean, stddev, **kwargs):
-        super(Gaussian1D, self).__init__(
-            amplitude=amplitude, mean=mean, stddev=stddev, **kwargs)
+    def bounding_box_default(self, factor=5.5):
+        """
+        Tuple defining the default ``bounding_box`` limits,
+        ``(x_low, x_high)``
+
+        Parameters
+        ----------
+        factor : float
+            The multiple of `stddev` used to define the limits.
+            The default is 5.5-sigma, corresponding to a relative error < 1e-7.
+
+        Examples
+        --------
+        >>> from astropy.modeling.models import Gaussian1D
+        >>> model = Gaussian1D(mean=0, stddev=2)
+        >>> model.bounding_box
+        (-11.0, 11.0)
+
+        This range can be set directly (see: `astropy.modeling.Model.bounding_box`) or by
+        using a different factor, like:
+
+        >>> model.bounding_box = model.bounding_box_default(factor=2)
+        >>> model.bounding_box
+        (-4.0, 4.0)
+        """
+
+        x0 = self.mean.value
+        dx = factor * self.stddev
+
+        return (x0 - dx, x0 + dx)
 
     @staticmethod
     def evaluate(x, amplitude, mean, stddev):
@@ -143,13 +173,9 @@ class GaussianAbsorption1D(Fittable1DModel):
     Gaussian1D
     """
 
-    amplitude = Parameter()
-    mean = Parameter()
-    stddev = Parameter()
-
-    def __init__(self, amplitude, mean, stddev, **kwargs):
-        super(GaussianAbsorption1D, self).__init__(
-            amplitude=amplitude, mean=mean, stddev=stddev, **kwargs)
+    amplitude = Parameter(default=1)
+    mean = Parameter(default=0)
+    stddev = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, amplitude, mean, stddev):
@@ -181,16 +207,16 @@ class Gaussian2D(Fittable2DModel):
     y_mean : float
         Mean of the Gaussian in y.
     x_stddev : float
-        Standard deviation of the Gaussian in x.
+        Standard deviation of the Gaussian in x before rotating by theta.
         ``x_stddev`` and ``y_stddev`` must be specified unless a covariance
         matrix (``cov_matrix``) is input.
     y_stddev : float
-        Standard deviation of the Gaussian in y.
+        Standard deviation of the Gaussian in y before rotating by theta.
         ``x_stddev`` and ``y_stddev`` must be specified unless a covariance
         matrix (``cov_matrix``) is input.
     theta : float, optional
         Rotation angle in radians. The rotation angle increases
-        counterclockwise.
+        counterclockwise, from the positive x-axis.
     cov_matrix : ndarray, optional
         A 2x2 covariance matrix. If specified, overrides the ``x_stddev``,
         ``y_stddev``, and ``theta`` specification.
@@ -238,21 +264,23 @@ class Gaussian2D(Fittable2DModel):
 
     See Also
     --------
-    Gaussian1D, Box2D, Beta2D
+    Gaussian1D, Box2D, Moffat2D
 
     References
     ----------
     .. [1] http://en.wikipedia.org/wiki/Gaussian_function
     """
 
-    amplitude = Parameter()
-    x_mean = Parameter()
-    y_mean = Parameter()
-    x_stddev = Parameter()
-    y_stddev = Parameter()
-    theta = Parameter()
+    amplitude = Parameter(default=1)
+    x_mean = Parameter(default=0)
+    y_mean = Parameter(default=0)
+    x_stddev = Parameter(default=1)
+    y_stddev = Parameter(default=1)
+    theta = Parameter(default=0)
+    _bounding_box = 'auto'
 
-    def __init__(self, amplitude, x_mean, y_mean, x_stddev=None, y_stddev=None,
+    def __init__(self, amplitude=amplitude.default, x_mean=x_mean.default,
+                 y_mean=y_mean.default, x_stddev=None, y_stddev=None,
                  theta=0.0, cov_matrix=None, **kwargs):
         if y_stddev is None and cov_matrix is None:
             raise InputParameterError(
@@ -269,9 +297,19 @@ class Gaussian2D(Fittable2DModel):
 
         # Compute principle coordinate system transformation
         elif cov_matrix is not None:
+            if (x_stddev is not None or y_stddev is not None):
+                raise InputParameterError(
+                    "Cannot specify both cov_matrix and x/y_stddev")
+            # Compute principle coordinate system transformation
             cov_matrix = np.array(cov_matrix)
+
             if cov_matrix.shape != (2, 2):
+                # TODO: Maybe it should be possible for the covariance matrix
+                # to be some (x, y, ..., z, 2, 2) array to be broadcast with
+                # other parameters of shape (x, y, ..., z)
+                # But that's maybe a special case to work out if/when needed
                 raise ValueError("Covariance matrix must be 2x2")
+
             eig_vals, eig_vecs = np.linalg.eig(cov_matrix)
             x_stddev, y_stddev = np.sqrt(eig_vals)
             y_vec = eig_vecs[:, 0]
@@ -280,6 +318,43 @@ class Gaussian2D(Fittable2DModel):
         super(Gaussian2D, self).__init__(
             amplitude=amplitude, x_mean=x_mean, y_mean=y_mean,
             x_stddev=x_stddev, y_stddev=y_stddev, theta=theta, **kwargs)
+
+    def bounding_box_default(self, factor=5.5):
+        """
+        Tuple defining the default ``bounding_box`` limits in each dimension,
+        ``((y_low, y_high), (x_low, x_high))``
+
+        The default offset from the mean is 5.5-sigma, corresponding
+        to a relative error < 1e-7. The limits are adjusted for rotation.
+
+        Parameters
+        ----------
+        factor : float, optional
+            The multiple of `x_stddev` and `y_stddev` used to define the limits.
+            The default is 5.5.
+
+        Examples
+        --------
+        >>> from astropy.modeling.models import Gaussian2D
+        >>> model = Gaussian2D(x_mean=0, y_mean=0, x_stddev=1, y_stddev=2)
+        >>> model.bounding_box
+        ((-11.0, 11.0), (-5.5, 5.5))
+
+        This range can be set directly (see: `astropy.modeling.Model.bounding_box`) or by
+        using a different factor like:
+
+        >>> model.bounding_box = model.bounding_box_default(factor=2)
+        >>> model.bounding_box
+        ((-4.0, 4.0), (-2.0, 2.0))
+        """
+
+        a = factor * self.x_stddev
+        b = factor * self.y_stddev
+        theta = self.theta.value
+        dx, dy = ellipse_extent(a, b, theta)
+
+        return ((self.y_mean - dy, self.y_mean + dy),
+                (self.x_mean - dx, self.x_mean + dx))
 
     @staticmethod
     def evaluate(x, y, amplitude, x_mean, y_mean, x_stddev, y_stddev, theta):
@@ -352,26 +427,24 @@ class Shift(Model):
 
     Parameters
     ----------
-    offsets : float or a list of floats
-        offsets to be applied to a coordinate
-        if a list - each value in the list is an offset to be applied to a
-        column in the input coordinate array
+    offset : float
+        Offset to add to a coordinate.
     """
 
-    offsets = Parameter()
+    inputs = ('x',)
+    outputs = ('x',)
 
-    def __init__(self, offsets, **kwargs):
-        super(Shift, self).__init__(offsets, **kwargs)
+    offset = Parameter(default=0)
 
     @property
     def inverse(self):
         inv = self.copy()
-        inv.offsets *= -1
+        inv.offset *= -1
         return inv
 
     @staticmethod
-    def evaluate(x, offsets):
-        return x + offsets
+    def evaluate(x, offset):
+        return x + offset
 
 
 class Scale(Model):
@@ -380,25 +453,25 @@ class Scale(Model):
 
     Parameters
     ----------
-    factors : float or a list of floats
-        scale for a coordinate
+    factor : float
+        Factor by which to scale a coordinate.
     """
 
-    factors = Parameter()
-    linear = True
+    inputs = ('x',)
+    outputs = ('x',)
 
-    def __init__(self, factors, **kwargs):
-        super(Scale, self).__init__(factors, **kwargs)
+    factor = Parameter(default=1)
+    linear = True
 
     @property
     def inverse(self):
         inv = self.copy()
-        inv.factors = 1 / self.factors
+        inv.factor = 1 / self.factor
         return inv
 
     @staticmethod
-    def evaluate(x, factors):
-        return factors * x
+    def evaluate(x, factor):
+        return factor * x
 
 
 class Redshift(Fittable1DModel):
@@ -417,10 +490,8 @@ class Redshift(Fittable1DModel):
         .. math:: \\lambda_{obs} = (1 + z) \\lambda_{rest}
 
     """
-    z = Parameter(description='redshift')
 
-    def __init__(self, z, **kwargs):
-        super(Redshift, self).__init__(z=z, **kwargs)
+    z = Parameter(description='redshift', default=0)
 
     @staticmethod
     def evaluate(x, z):
@@ -443,6 +514,92 @@ class Redshift(Fittable1DModel):
         return inv
 
 
+class Sersic1D(Fittable1DModel):
+    r"""
+    One dimensional Sersic surface brightness profile.
+
+    Parameters
+    ----------
+    amplitude : float
+        Central surface brightness, within r_eff.
+    r_eff : float
+        Effective (half-light) radius
+    n : float
+        Sersic Index.
+
+    See Also
+    --------
+    Gaussian1D, Moffat1D, Lorentz1D
+
+    Notes
+    -----
+    Model formula:
+
+    .. math::
+
+        I(r)=I_e exp\left[-b_n\left(\frac{r}{r_{e}}\right)^{(1/n)}-1\right]
+
+    The constant :math:`b_n` is defined such that :math:`r_e` contains half the total
+    luminosity, and can be solved for numerically.
+
+    .. math::
+
+        \Gamma(2n) = 2\gamma (b_n,2n)
+
+    Examples
+    --------
+    .. plot::
+        :include-source:
+
+        import numpy as np
+        from astropy.modeling.models import Sersic1D
+        import matplotlib.pyplot as plt
+
+        plt.figure()
+        plt.subplot(111, xscale='log', yscale='log')
+        s1 = Sersic1D(amplitude=1, r_eff=5)
+        r=np.arange(0, 100, .01)
+
+        for n in range(1, 10):
+             s1.n = n
+             plt.plot(r, s1(r), color=str(float(n) / 15))
+
+        plt.axis([1e-1, 30, 1e-2, 1e3])
+        plt.xlabel('log Radius')
+        plt.ylabel('log Surface Brightness')
+        plt.text(.25, 1.5, 'n=1')
+        plt.text(.25, 300, 'n=10')
+        plt.xticks([])
+        plt.yticks([])
+        plt.show()
+
+    References
+    ----------
+    .. [1] http://ned.ipac.caltech.edu/level5/March05/Graham/Graham2.html
+    """
+
+    amplitude = Parameter(default=1)
+    r_eff = Parameter(default=1)
+    n = Parameter(default=4)
+    _gammaincinv = None
+
+    def __init__(self, amplitude=amplitude.default, r_eff=r_eff.default,
+                 n=n.default, **kwargs):
+        try:
+            from scipy.special import gammaincinv
+            self.__class__._gammaincinv = gammaincinv
+        except ValueError:
+            raise ImportError("Sersic1D model requires scipy > 0.11.")
+
+        super(Sersic1D, self).__init__(
+            amplitude=amplitude, r_eff=r_eff, n=n, **kwargs)
+
+    @classmethod
+    def evaluate(cls, r, amplitude, r_eff, n):
+        """One dimensional Sersic profile function."""
+        return amplitude * np.exp(-cls._gammaincinv(2 * n, 0.5) * ((r / r_eff) ** (1 / n) - 1))
+
+
 class Sine1D(Fittable1DModel):
     """
     One dimensional Sine model.
@@ -453,6 +610,8 @@ class Sine1D(Fittable1DModel):
         Oscillation amplitude
     frequency : float
         Oscillation frequency
+    phase : float
+        Osciallation phase
 
     See Also
     --------
@@ -463,30 +622,29 @@ class Sine1D(Fittable1DModel):
     -----
     Model formula:
 
-        .. math:: f(x) = A \\sin(2 \\pi f x)
+        .. math:: f(x) = A \\sin(2 \\pi f x + 2 \\pi p)
     """
 
-    amplitude = Parameter()
-    frequency = Parameter()
-
-    def __init__(self, amplitude, frequency, **kwargs):
-        super(Sine1D, self).__init__(
-            amplitude=amplitude, frequency=frequency, **kwargs)
+    amplitude = Parameter(default=1)
+    frequency = Parameter(default=1)
+    phase = Parameter(default=0)
 
     @staticmethod
-    def evaluate(x, amplitude, frequency):
+    def evaluate(x, amplitude, frequency, phase):
         """One dimensional Sine model function"""
 
-        return amplitude * np.sin(2 * np.pi * frequency * x)
+        return amplitude * np.sin(2 * np.pi * frequency * x + 2 * np.pi * phase)
 
     @staticmethod
-    def fit_deriv(x, amplitude, frequency):
+    def fit_deriv(x, amplitude, frequency, phase):
         """One dimensional Sine model derivative"""
 
-        d_amplitude = np.sin(2 * np.pi * frequency * x)
+        d_amplitude = np.sin(2 * np.pi * frequency * x + 2 * np.pi * phase)
         d_frequency = (2 * np.pi * x * amplitude *
-                       np.cos(2 * np.pi * frequency * x))
-        return [d_amplitude, d_frequency]
+                       np.cos(2 * np.pi * frequency * x + 2 * np.pi * phase))
+        d_phase = (2 * np.pi * amplitude *
+                   np.cos(2 * np.pi * frequency * x + 2 * np.pi * phase))
+        return [d_amplitude, d_frequency, d_phase]
 
 
 class Linear1D(Fittable1DModel):
@@ -512,13 +670,9 @@ class Linear1D(Fittable1DModel):
         .. math:: f(x) = a x + b
     """
 
-    slope = Parameter()
-    intercept = Parameter()
+    slope = Parameter(default=1)
+    intercept = Parameter(default=0)
     linear = True
-
-    def __init__(self, slope, intercept, **kwargs):
-        super(Linear1D, self).__init__(
-            slope=slope, intercept=intercept, **kwargs)
 
     @staticmethod
     def evaluate(x, slope, intercept):
@@ -561,30 +715,118 @@ class Lorentz1D(Fittable1DModel):
         f(x) = \\frac{A \\gamma^{2}}{\\gamma^{2} + \\left(x - x_{0}\\right)^{2}}
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    fwhm = Parameter()
-
-    def __init__(self, amplitude, x_0, fwhm, **kwargs):
-        super(Lorentz1D, self).__init__(
-            amplitude=amplitude, x_0=x_0, fwhm=fwhm, **kwargs)
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    fwhm = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, amplitude, x_0, fwhm):
         """One dimensional Lorentzian model function"""
 
         return (amplitude * ((fwhm / 2.) ** 2) / ((x - x_0) ** 2 +
-                (fwhm / 2.) ** 2))
+                                                  (fwhm / 2.) ** 2))
 
     @staticmethod
     def fit_deriv(x, amplitude, x_0, fwhm):
-        """One dimensional Lorentzian model derivative wiht respect to parameters"""
+        """One dimensional Lorentzian model derivative with respect to parameters"""
 
         d_amplitude = fwhm ** 2 / (fwhm ** 2 + (x - x_0) ** 2)
         d_x_0 = (amplitude * d_amplitude * (2 * x - 2 * x_0) /
                  (fwhm ** 2 + (x - x_0) ** 2))
         d_fwhm = 2 * amplitude * d_amplitude / fwhm * (1 - d_amplitude)
         return [d_amplitude, d_x_0, d_fwhm]
+
+
+class Voigt1D(Fittable1DModel):
+    """
+    One dimensional model for the Voigt profile.
+
+    Parameters
+    ----------
+    x_0 : float
+        Position of the peak
+    amplitude_L : float
+        The Lorentzian amplitude
+    fwhm_L : float
+        The Lorentzian full width at half maximum
+    fwhm_G : float
+        The Gaussian full width at half maximum
+
+    See Also
+    --------
+    Gaussian1D, Lorentz1D
+
+    Notes
+    -----
+    Algorithm for the computation taken from
+    McLean, A. B., Mitchell, C. E. J. & Swanston, D. M. Implementation of an
+    efficient analytical approximation to the Voigt function for photoemission
+    lineshape analysis. Journal of Electron Spectroscopy and Related Phenomena
+    69, 125-132 (1994)
+
+    Examples
+    --------
+    .. plot::
+        :include-source:
+
+        import numpy as np
+        from astropy.modeling.models import Voigt1D
+        import matplotlib.pyplot as plt
+
+        plt.figure()
+        x = np.arange(0, 10, 0.01)
+        v1 = Voigt1D(x_0=5, amplitude_L=10, fwhm_L=0.5, fwhm_G=0.9)
+        plt.plot(x, v1(x))
+        plt.show()
+    """
+
+    x_0 = Parameter(default=0)
+    amplitude_L = Parameter(default=1)
+    fwhm_L = Parameter(default=2/np.pi)
+    fwhm_G = Parameter(default=np.log(2))
+
+    _abcd = np.array([
+        [-1.2150, -1.3509, -1.2150, -1.3509],  # A
+        [1.2359, 0.3786, -1.2359, -0.3786],    # B
+        [-0.3085, 0.5906, -0.3085, 0.5906],    # C
+        [0.0210, -1.1858, -0.0210, 1.1858]])   # D
+
+    @classmethod
+    def evaluate(cls, x, x_0, amplitude_L, fwhm_L, fwhm_G):
+
+        A, B, C, D = cls._abcd
+        sqrt_ln2 = np.sqrt(np.log(2))
+        X = (x - x_0) * 2 * sqrt_ln2 / fwhm_G
+        X = np.atleast_1d(X)[..., np.newaxis]
+        Y = fwhm_L * sqrt_ln2 / fwhm_G
+        Y = np.atleast_1d(Y)[..., np.newaxis]
+
+        V = np.sum((C * (Y - A) + D * (X - B))/(((Y - A) ** 2 + (X - B) ** 2)), axis=-1)
+
+        return (fwhm_L * amplitude_L * np.sqrt(np.pi) * sqrt_ln2 / fwhm_G) * V
+
+    @classmethod
+    def fit_deriv(cls, x, x_0, amplitude_L, fwhm_L, fwhm_G):
+
+        A, B, C, D = cls._abcd
+        sqrt_ln2 = np.sqrt(np.log(2))
+        X = (x - x_0) * 2 * sqrt_ln2 / fwhm_G
+        X = np.atleast_1d(X)[:, np.newaxis]
+        Y = fwhm_L * sqrt_ln2 / fwhm_G
+        Y = np.atleast_1d(Y)[:, np.newaxis]
+        constant = fwhm_L * amplitude_L * np.sqrt(np.pi) * sqrt_ln2 / fwhm_G
+
+        alpha = C * (Y - A) + D * (X - B)
+        beta = (Y - A) ** 2 + (X - B) ** 2
+        V = np.sum((alpha / beta), axis=-1)
+        dVdx = np.sum((D/beta - 2 * (X - B) * alpha / np.square(beta)), axis=-1)
+        dVdy = np.sum((C/beta - 2 * (Y - A) * alpha / np.square(beta)), axis=-1)
+
+        dyda = [-constant * dVdx * 2 * sqrt_ln2 / fwhm_G,
+                constant * V / amplitude_L,
+                constant * (V / fwhm_L + dVdy * sqrt_ln2 / fwhm_G),
+                -constant * (V + (sqrt_ln2 / fwhm_G) * (2 * (x - x_0) * dVdx + fwhm_L * dVdy)) / fwhm_G]
+        return dyda
 
 
 class Const1D(Fittable1DModel):
@@ -607,18 +849,15 @@ class Const1D(Fittable1DModel):
         .. math:: f(x) = A
     """
 
-    amplitude = Parameter()
+    amplitude = Parameter(default=1)
     linear = True
-
-    def __init__(self, amplitude, **kwargs):
-        super(Const1D, self).__init__(amplitude=amplitude, **kwargs)
 
     @staticmethod
     def evaluate(x, amplitude):
         """One dimensional Constant model function"""
 
         if amplitude.size == 1:
-            # This is slighly faster than using ones_like and multiplying
+            # This is slightly faster than using ones_like and multiplying
             x = np.empty_like(x)
             x.fill(amplitude.item())
         else:
@@ -656,18 +895,15 @@ class Const2D(Fittable2DModel):
         .. math:: f(x, y) = A
     """
 
-    amplitude = Parameter()
+    amplitude = Parameter(default=1)
     linear = True
-
-    def __init__(self, amplitude, **kwargs):
-        super(Const2D, self).__init__(amplitude=amplitude, **kwargs)
 
     @staticmethod
     def evaluate(x, y, amplitude):
         """Two dimensional Constant model function"""
 
         if amplitude.size == 1:
-            # This is slighly faster than using ones_like and multiplying
+            # This is slightly faster than using ones_like and multiplying
             x = np.empty_like(x)
             x.fill(amplitude.item())
         else:
@@ -676,6 +912,117 @@ class Const2D(Fittable2DModel):
             x = amplitude * np.ones_like(x)
 
         return x
+
+
+class Ellipse2D(Fittable2DModel):
+    """
+    A 2D Ellipse model.
+
+    Parameters
+    ----------
+    amplitude : float
+        Value of the ellipse.
+
+    x_0 : float
+        x position of the center of the disk.
+
+    y_0 : float
+        y position of the center of the disk.
+
+    a : float
+        The length of the semimajor axis.
+
+    b : float
+        The length of the semiminor axis.
+
+    theta : float
+        The rotation angle in radians of the semimajor axis.  The
+        rotation angle increases counterclockwise from the positive x
+        axis.
+
+    See Also
+    --------
+    Disk2D, Box2D
+
+    Notes
+    -----
+    Model formula:
+
+    .. math::
+
+        f(x, y) = \\left \\{
+                    \\begin{array}{ll}
+                      \\mathrm{amplitude} & : \\left[\\frac{(x - x_0) \\cos
+                        \\theta + (y - y_0) \\sin \\theta}{a}\\right]^2 +
+                        \\left[\\frac{-(x - x_0) \\sin \\theta + (y - y_0)
+                        \\cos \\theta}{b}\\right]^2  \\leq 1 \\\\
+                      0 & : \\mathrm{otherwise}
+                    \\end{array}
+                  \\right.
+
+    Examples
+    --------
+    .. plot::
+        :include-source:
+
+        import numpy as np
+        from astropy.modeling.models import Ellipse2D
+        from astropy.coordinates import Angle
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        x0, y0 = 25, 25
+        a, b = 20, 10
+        theta = Angle(30, 'deg')
+        e = Ellipse2D(amplitude=100., x_0=x0, y_0=y0, a=a, b=b,
+                      theta=theta.radian)
+        y, x = np.mgrid[0:50, 0:50]
+        fig, ax = plt.subplots(1, 1)
+        ax.imshow(e(x, y), origin='lower', interpolation='none', cmap='Greys_r')
+        e2 = mpatches.Ellipse((x0, y0), 2*a, 2*b, theta.degree, edgecolor='red',
+                              facecolor='none')
+        ax.add_patch(e2)
+        plt.show()
+    """
+
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    y_0 = Parameter(default=0)
+    a = Parameter(default=1)
+    b = Parameter(default=1)
+    theta = Parameter(default=0)
+    _bounding_box = 'auto'
+
+    def bounding_box_default(self):
+        """
+        Tuple defining the default ``bounding_box`` limits around the ellipse.
+
+        ``((y_low, y_high), (x_low, x_high))``
+
+        References
+        ----------
+        `astropy.modeling.Model.bounding_box`
+        """
+
+        a = self.a
+        b = self.b
+        theta = self.theta.value
+        dx, dy = ellipse_extent(a, b, theta)
+
+        return ((self.y_0 - dy, self.y_0 + dy),
+                (self.x_0 - dx, self.x_0 + dx))
+
+    @staticmethod
+    def evaluate(x, y, amplitude, x_0, y_0, a, b, theta):
+        """Two dimensional Ellipse model function."""
+
+        xx = x - x_0
+        yy = y - y_0
+        cost = np.cos(theta)
+        sint = np.sin(theta)
+        numerator1 = (xx * cost) + (yy * sint)
+        numerator2 = -(xx * sint) + (yy * cost)
+        in_ellipse = (((numerator1 / a) ** 2 + (numerator2 / b) ** 2) <= 1.)
+        return np.select([in_ellipse], [amplitude])
 
 
 class Disk2D(Fittable2DModel):
@@ -711,14 +1058,10 @@ class Disk2D(Fittable2DModel):
                    \\right.
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    y_0 = Parameter()
-    R_0 = Parameter()
-
-    def __init__(self, amplitude, x_0, y_0, R_0, **kwargs):
-        super(Disk2D, self).__init__(
-            amplitude=amplitude, x_0=x_0, y_0=y_0, R_0=R_0, **kwargs)
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    y_0 = Parameter(default=0)
+    R_0 = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, y, amplitude, x_0, y_0, R_0):
@@ -729,7 +1072,6 @@ class Disk2D(Fittable2DModel):
 
 
 class Ring2D(Fittable2DModel):
-
     """
     Two dimensional radial symmetric Ring model.
 
@@ -768,18 +1110,22 @@ class Ring2D(Fittable2DModel):
     Where :math:`r_{out} = r_{in} + r_{width}`.
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    y_0 = Parameter()
-    r_in = Parameter()
-    width = Parameter()
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    y_0 = Parameter(default=0)
+    r_in = Parameter(default=1)
+    width = Parameter(default=1)
 
-    def __init__(self, amplitude, x_0, y_0, r_in, width=None, r_out=None,
-                 **kwargs):
+    def __init__(self, amplitude=amplitude.default, x_0=x_0.default,
+                 y_0=y_0.default, r_in=r_in.default, width=width.default,
+                 r_out=None, **kwargs):
         if r_out is not None:
+            if width is not None:
+                raise InputParameterError(
+                    "Cannot specify both width and outer radius separately.")
             width = r_out - r_in
-        if r_out is None and width is None:
-            raise ModelDefinitionError("Either specify width or r_out.")
+        elif width is None:
+            width = self.width.default
 
         super(Ring2D, self).__init__(
             amplitude=amplitude, x_0=x_0, y_0=y_0, r_in=r_in, width=width,
@@ -839,13 +1185,9 @@ class Box1D(Fittable1DModel):
                    \\right.
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    width = Parameter()
-
-    def __init__(self, amplitude, x_0, width, **kwargs):
-        super(Box1D, self).__init__(
-            amplitude=amplitude, x_0=x_0, width=width, **kwargs)
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    width = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, amplitude, x_0, width):
@@ -884,7 +1226,7 @@ class Box2D(Fittable2DModel):
 
     See Also
     --------
-    Box1D, Gaussian2D, Beta2D
+    Box1D, Gaussian2D, Moffat2D
 
     Notes
     -----
@@ -902,16 +1244,11 @@ class Box2D(Fittable2DModel):
 
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    y_0 = Parameter()
-    x_width = Parameter()
-    y_width = Parameter()
-
-    def __init__(self, amplitude, x_0, y_0, x_width, y_width, **kwargs):
-        super(Box2D, self).__init__(
-            amplitude=amplitude, x_0=x_0, y_0=y_0, x_width=x_width,
-            y_width=y_width, **kwargs)
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    y_0 = Parameter(default=0)
+    x_width = Parameter(default=1)
+    y_width = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, y, amplitude, x_0, y_0, x_width, y_width):
@@ -941,17 +1278,13 @@ class Trapezoid1D(Fittable1DModel):
 
     See Also
     --------
-    Box1D, Gaussian1D, Beta1D
+    Box1D, Gaussian1D, Moffat1D
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    width = Parameter()
-    slope = Parameter()
-
-    def __init__(self, amplitude, x_0, width, slope, **kwargs):
-        super(Trapezoid1D, self).__init__(
-            amplitude=amplitude, x_0=x_0, width=width, slope=slope, **kwargs)
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    width = Parameter(default=1)
+    slope = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, amplitude, x_0, width, slope):
@@ -996,16 +1329,11 @@ class TrapezoidDisk2D(Fittable2DModel):
     Disk2D, Box2D
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    y_0 = Parameter()
-    R_0 = Parameter()
-    slope = Parameter()
-
-    def __init__(self, amplitude, x_0, y_0, R_0, slope, **kwargs):
-        super(TrapezoidDisk2D, self).__init__(
-            amplitude=amplitude, x_0=x_0, y_0=y_0, R_0=R_0, slope=slope,
-            **kwargs)
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    y_0 = Parameter(default=0)
+    R_0 = Parameter(default=1)
+    slope = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, y, amplitude, x_0, y_0, R_0, slope):
@@ -1013,7 +1341,7 @@ class TrapezoidDisk2D(Fittable2DModel):
 
         r = np.sqrt((x - x_0) ** 2 + (y - y_0) ** 2)
         range_1 = r <= R_0
-        range_2 = np.logical_and(r > R_0,  r <= R_0 + amplitude / slope)
+        range_2 = np.logical_and(r > R_0, r <= R_0 + amplitude / slope)
         val_1 = amplitude
         val_2 = amplitude + slope * (R_0 - r)
         return np.select([range_1, range_2], [val_1, val_2])
@@ -1047,13 +1375,9 @@ class MexicanHat1D(Fittable1DModel):
 
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    sigma = Parameter()
-
-    def __init__(self, amplitude, x_0, sigma, **kwargs):
-        super(MexicanHat1D, self).__init__(
-            amplitude=amplitude, x_0=x_0, sigma=sigma, **kwargs)
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    sigma = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, amplitude, x_0, sigma):
@@ -1094,14 +1418,10 @@ class MexicanHat2D(Fittable2DModel):
         - \\left(y - y_{0}\\right)^{2}}{2 \\sigma^{2}}}
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    y_0 = Parameter()
-    sigma = Parameter()
-
-    def __init__(self, amplitude, x_0, y_0, sigma, **kwargs):
-        super(MexicanHat2D, self).__init__(
-            amplitude=amplitude, x_0=x_0, y_0=y_0, sigma=sigma, **kwargs)
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    y_0 = Parameter(default=0)
+    sigma = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, y, amplitude, x_0, y_0, sigma):
@@ -1154,13 +1474,14 @@ class AiryDisk2D(Fittable2DModel):
     .. [1] http://en.wikipedia.org/wiki/Airy_disk
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    y_0 = Parameter()
-    radius = Parameter()
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    y_0 = Parameter(default=0)
+    radius = Parameter(default=1)
     _j1 = None
 
-    def __init__(self, amplitude, x_0, y_0, radius, **kwargs):
+    def __init__(self, amplitude=amplitude.default, x_0=x_0.default,
+                 y_0=y_0.default, radius=radius.default, **kwargs):
         if self._j1 is None:
             try:
                 from scipy.special import j1, jn_zeros
@@ -1195,25 +1516,25 @@ class AiryDisk2D(Fittable2DModel):
         # separately so as not to raise a numpy warning
         z = np.ones(r.shape)
         rt = np.pi * r[r > 0]
-        z[r > 0] = (2.0 * cls._j1(rt) / rt)**2
+        z[r > 0] = (2.0 * cls._j1(rt) / rt) ** 2
         z *= amplitude
         return z
 
 
-class Beta1D(Fittable1DModel):
+class Moffat1D(Fittable1DModel):
     """
-    One dimensional Beta model.
+    One dimensional Moffat model.
 
     Parameters
     ----------
     amplitude : float
         Amplitude of the model.
     x_0 : float
-        x position of the maximum of the Beta model.
+        x position of the maximum of the Moffat model.
     gamma : float
-        Core width of the Beta model.
+        Core width of the Moffat model.
     alpha : float
-        Power index of the beta model.
+        Power index of the Moffat model.
 
     See Also
     --------
@@ -1228,24 +1549,20 @@ class Beta1D(Fittable1DModel):
         f(x) = A \\left(1 + \\frac{\\left(x - x_{0}\\right)^{2}}{\\gamma^{2}}\\right)^{- \\alpha}
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    gamma = Parameter()
-    alpha = Parameter()
-
-    def __init__(self, amplitude, x_0, gamma, alpha, **kwargs):
-        super(Beta1D, self).__init__(
-            amplitude=amplitude, x_0=x_0, gamma=gamma, alpha=alpha, **kwargs)
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    gamma = Parameter(default=1)
+    alpha = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, amplitude, x_0, gamma, alpha):
-        """One dimensional Beta model function"""
+        """One dimensional Moffat model function"""
 
         return amplitude * (1 + ((x - x_0) / gamma) ** 2) ** (-alpha)
 
     @staticmethod
     def fit_deriv(x, amplitude, x_0, gamma, alpha):
-        """One dimensional Beta model derivative with respect to parameters"""
+        """One dimensional Moffat model derivative with respect to parameters"""
 
         d_A = (1 + (x - x_0) ** 2 / gamma ** 2) ** (-alpha)
         d_x_0 = (-amplitude * alpha * d_A * (-2 * x + 2 * x_0) /
@@ -1256,22 +1573,22 @@ class Beta1D(Fittable1DModel):
         return [d_A, d_x_0, d_gamma, d_alpha]
 
 
-class Beta2D(Fittable2DModel):
+class Moffat2D(Fittable2DModel):
     """
-    Two dimensional Beta model.
+    Two dimensional Moffat model.
 
     Parameters
     ----------
     amplitude : float
         Amplitude of the model.
     x_0 : float
-        x position of the maximum of the Beta model.
+        x position of the maximum of the Moffat model.
     y_0 : float
-        y position of the maximum of the Beta model.
+        y position of the maximum of the Moffat model.
     gamma : float
-        Core width of the Beta model.
+        Core width of the Moffat model.
     alpha : float
-        Power index of the beta model.
+        Power index of the Moffat model.
 
     See Also
     --------
@@ -1287,27 +1604,22 @@ class Beta2D(Fittable2DModel):
         \\left(y - y_{0}\\right)^{2}}{\\gamma^{2}}\\right)^{- \\alpha}
     """
 
-    amplitude = Parameter()
-    x_0 = Parameter()
-    y_0 = Parameter()
-    gamma = Parameter()
-    alpha = Parameter()
-
-    def __init__(self, amplitude, x_0, y_0, gamma, alpha, **kwargs):
-        super(Beta2D, self).__init__(
-            amplitude=amplitude, x_0=x_0, y_0=y_0, gamma=gamma, alpha=alpha,
-            **kwargs)
+    amplitude = Parameter(default=1)
+    x_0 = Parameter(default=0)
+    y_0 = Parameter(default=0)
+    gamma = Parameter(default=1)
+    alpha = Parameter(default=1)
 
     @staticmethod
     def evaluate(x, y, amplitude, x_0, y_0, gamma, alpha):
-        """Two dimensional Beta model function"""
+        """Two dimensional Moffat model function"""
 
         rr_gg = ((x - x_0) ** 2 + (y - y_0) ** 2) / gamma ** 2
         return amplitude * (1 + rr_gg) ** (-alpha)
 
     @staticmethod
     def fit_deriv(x, y, amplitude, x_0, y_0, gamma, alpha):
-        """Two dimensional Beta model derivative with respect to parameters"""
+        """Two dimensional Moffat model derivative with respect to parameters"""
 
         rr_gg = ((x - x_0) ** 2 + (y - y_0) ** 2) / gamma ** 2
         d_A = (1 + rr_gg) ** (-alpha)
@@ -1320,16 +1632,121 @@ class Beta2D(Fittable2DModel):
         return [d_A, d_x_0, d_y_0, d_gamma, d_alpha]
 
 
+class Sersic2D(Fittable2DModel):
+    r"""
+    Two dimensional Sersic surface brightness profile.
+
+    Parameters
+    ----------
+    amplitude : float
+        Central surface brightness, within r_eff.
+    r_eff : float
+        Effective (half-light) radius
+    n : float
+        Sersic Index.
+    x_0 : float, optional
+        x position of the center.
+    y_0 : float, optional
+        y position of the center.
+    ellip : float, optional
+        Ellipticity.
+    theta : float, optional
+        Rotation angle in radians, counterclockwise from
+        the positive x-axis.
+
+    See Also
+    --------
+    Gaussian2D, Moffat2D
+
+    Notes
+    -----
+    Model formula:
+
+    .. math::
+
+        I(x,y) = I(r) = I_e\exp\left[-b_n\left(\frac{r}{r_{e}}\right)^{(1/n)}-1\right]
+
+    The constant :math:`b_n` is defined such that :math:`r_e` contains half the total
+    luminosity, and can be solved for numerically.
+
+    .. math::
+
+        \Gamma(2n) = 2\gamma (b_n,2n)
+
+    Examples
+    --------
+    .. plot::
+        :include-source:
+
+        import numpy as np
+        from astropy.modeling.models import Sersic2D
+        import matplotlib.pyplot as plt
+
+        x,y = np.meshgrid(np.arange(100), np.arange(100))
+
+        mod = Sersic2D(amplitude = 1, r_eff = 25, n=4, x_0=50, y_0=50,
+                       ellip=.5, theta=-1)
+        img = mod(x, y)
+        log_img = np.log10(img)
+
+
+        plt.figure()
+        plt.imshow(log_img, origin='lower', interpolation='nearest',
+                   vmin=-1, vmax=2)
+        plt.xlabel('x')
+        plt.ylabel('y')
+        cbar = plt.colorbar()
+        cbar.set_label('Log Brightness', rotation=270, labelpad=25)
+        cbar.set_ticks([-1, 0, 1, 2], update_ticks=True)
+        plt.show()
+
+    References
+    ----------
+    .. [1] http://ned.ipac.caltech.edu/level5/March05/Graham/Graham2.html
+    """
+
+    amplitude = Parameter(default=1)
+    r_eff = Parameter(default=1)
+    n = Parameter(default=4)
+    x_0 = Parameter(default=0)
+    y_0 = Parameter(default=0)
+    ellip = Parameter(default=0)
+    theta = Parameter(default=0)
+    _gammaincinv = None
+
+    def __init__(self, amplitude=amplitude.default, r_eff=r_eff.default,
+                 n=n.default, x_0=x_0.default, y_0=y_0.default, ellip=ellip.default,
+                 theta=theta.default, **kwargs):
+        try:
+            from scipy.special import gammaincinv
+            self.__class__._gammaincinv = gammaincinv
+        except ValueError:
+            raise ImportError("Sersic2D model requires scipy > 0.11.")
+
+        super(Sersic2D, self).__init__(
+            amplitude=amplitude, r_eff=r_eff, n=n, x_0=x_0, y_0=y_0,
+            ellip=ellip, theta=theta, **kwargs)
+
+    @classmethod
+    def evaluate(cls, x, y, amplitude, r_eff, n, x_0, y_0, ellip, theta):
+        """Two dimensional Sersic profile function."""
+
+        bn = cls._gammaincinv(2. * n, 0.5)
+        a, b = r_eff, (1 - ellip) * r_eff
+        cos_theta, sin_theta = np.cos(theta), np.sin(theta)
+        x_maj = (x - x_0) * cos_theta + (y - y_0) * sin_theta
+        x_min = -(x - x_0) * sin_theta + (y - y_0) * cos_theta
+        z = np.sqrt((x_maj / a) ** 2 + (x_min / b) ** 2)
+
+        return amplitude * np.exp(-bn * (z ** (1 / n) - 1))
+
+
 @deprecated('1.0', alternative='astropy.modeling.models.custom_model',
             pending=True)
 def custom_model_1d(func, func_fit_deriv=None):
-    argspec = inspect.getargspec(func)
-    param_values = argspec.defaults
-    nparams = len(param_values)
+    inputs, params = get_inputs_and_params(func)
 
-    if len(argspec.args) == nparams + 1:
-        param_names = argspec.args[-nparams:]
-    else:
+    if len(inputs) != 1:
         raise ModelDefinitionError(
             "All parameters must be keyword arguments")
 

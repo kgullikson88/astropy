@@ -113,12 +113,8 @@ class _AngleParser(object):
                 "Invalid character at col {0}".format(t.lexpos))
 
         # Build the lexer
-        try:
-            from . import angle_lextab
-            lexer = lex.lex(optimize=True, lextab=angle_lextab)
-        except ImportError:
-            lexer = lex.lex(optimize=True, lextab='angle_lextab',
-                            outputdir=os.path.dirname(__file__))
+        lexer = lex.lex(optimize=True, lextab='angle_lextab',
+                        outputdir=os.path.dirname(__file__))
 
         def p_angle(p):
             '''
@@ -242,13 +238,9 @@ class _AngleParser(object):
         def p_error(p):
             raise ValueError
 
-        try:
-            from . import angle_parsetab
-            parser = yacc.yacc(debug=False, tabmodule=angle_parsetab,
-                               write_tables=False)
-        except ImportError:
-            parser = yacc.yacc(debug=False, tabmodule='angle_parsetab',
-                               outputdir=os.path.dirname(__file__))
+        parser = yacc.yacc(debug=False, tabmodule='angle_parsetab',
+                           outputdir=os.path.dirname(__file__),
+                           write_tables=True)
 
         return parser, lexer
 
@@ -640,7 +632,7 @@ def angular_separation(lon1, lat1, lon2, lat2):
     Notes
     -----
     The angular separation is calculated using the Vincenty formula [1]_,
-    which is slighly more complex and computationally expensive than
+    which is slightly more complex and computationally expensive than
     some alternatives, but is stable at at all distances, including the
     poles and antipodes.
 

@@ -1,11 +1,12 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
 """
-This module prvoides the tools used to internally run the astropy test suite
+This module provides the tools used to internally run the astropy test suite
 from the installed astropy.  It makes use of the `pytest` testing framework.
 """
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
+from ..config.paths import set_temp_config, set_temp_cache
 from ..extern import six
 from ..extern.six.moves import cPickle as pickle
 
@@ -17,11 +18,15 @@ import zlib
 import functools
 import multiprocessing
 import os
-import subprocess
-import shutil
 import tempfile
 import types
 import warnings
+
+__all__ = ['raises', 'enable_deprecations_as_exceptions', 'remote_data',
+           'treat_deprecations_as_exceptions', 'catch_warnings',
+           'assert_follows_unicode_guidelines', 'quantity_allclose',
+           'assert_quantity_allclose', 'check_pickling_recovery',
+           'pickle_protocol', 'generic_recursive_equality_test']
 
 try:
     # Import pkg_resources to prevent it from issuing warnings upon being
@@ -31,13 +36,11 @@ try:
 except ImportError:
     pass
 
-from distutils.core import Command
-
 from .. import test
 from ..utils.exceptions import (AstropyWarning,
                                 AstropyDeprecationWarning,
                                 AstropyPendingDeprecationWarning)
-from ..config import configuration
+
 
 if os.environ.get('ASTROPY_USE_SYSTEM_PYTEST') or '_pytest' in sys.modules:
     import pytest
@@ -110,13 +113,6 @@ class TestRunner(object):
         """
         The docstring for this method lives in astropy/__init__.py:test
         """
-        try:
-            get_ipython()
-        except NameError:
-            pass
-        else:
-            raise RuntimeError(
-                "Running astropy tests inside of IPython is not supported.")
 
         if coverage:
             warnings.warn(
@@ -216,15 +212,17 @@ class TestRunner(object):
 
         # check for opened files after each test
         if open_files:
-            try:
-                subproc = subprocess.Popen(
-                    ['lsof -F0 -n -p {0}'.format(os.getpid())],
-                    shell=True, stdout=subprocess.PIPE)
-                output = subproc.communicate()[0].strip()
-            except subprocess.CalledProcessError:
+            if parallel != 0:
                 raise SystemError(
-                    "open file detection requested, but could not "
-                    "successfully run the 'lsof' command")
+                    "open file detection may not be used in conjunction with "
+                    "parallel testing.")
+
+            try:
+                import psutil
+            except ImportError:
+                raise SystemError(
+                    "open file detection requested, but psutil package "
+                    "is not installed.")
 
             all_args.append('--open-files')
 
@@ -256,40 +254,21 @@ class TestRunner(object):
 
         # override the config locations to not make a new directory nor use
         # existing cache or config
-        xdg_config_home = os.environ.get('XDG_CONFIG_HOME')
-        xdg_cache_home = os.environ.get('XDG_CACHE_HOME')
         astropy_config = tempfile.mkdtemp('astropy_config')
         astropy_cache = tempfile.mkdtemp('astropy_cache')
-        os.environ[str('XDG_CONFIG_HOME')] = str(astropy_config)
-        os.environ[str('XDG_CACHE_HOME')] = str(astropy_cache)
-        os.mkdir(os.path.join(os.environ['XDG_CONFIG_HOME'], 'astropy'))
-        os.mkdir(os.path.join(os.environ['XDG_CACHE_HOME'], 'astropy'))
-        # To fully force configuration reloading from a different file (in this
-        # case our default one in a temp directory), clear the config object
-        # cache.
-        configuration._cfgobjs.clear()
 
         # This prevents cyclical import problems that make it
         # impossible to test packages that define Table types on their
         # own.
         from ..table import Table
 
-        try:
-            result = pytest.main(args=all_args, plugins=plugins)
-        finally:
-            shutil.rmtree(os.environ['XDG_CONFIG_HOME'])
-            shutil.rmtree(os.environ['XDG_CACHE_HOME'])
-            if xdg_config_home is not None:
-                os.environ[str('XDG_CONFIG_HOME')] = xdg_config_home
-            else:
-                del os.environ['XDG_CONFIG_HOME']
-            if xdg_cache_home is not None:
-                os.environ[str('XDG_CACHE_HOME')] = xdg_cache_home
-            else:
-                del os.environ['XDG_CACHE_HOME']
-            configuration._cfgobjs.clear()
-
-        return result
+        # Have to use nested with statements for cross-Python support
+        # Note, using these context managers here is superfluous if the
+        # config_dir or cache_dir options to py.test are in use, but it's
+        # also harmless to nest the contexts
+        with set_temp_config(astropy_config, delete=True):
+            with set_temp_cache(astropy_cache, delete=True):
+                return pytest.main(args=all_args, plugins=plugins)
 
     run_tests.__doc__ = test.__doc__
 
@@ -324,15 +303,24 @@ def _save_coverage(cov, result, rootdir, testing_path):
     # long as 2to3 is needed). Therefore we only do this fix for
     # Python 2.x.
     if six.PY2:
-        d = cov.data
-        cov._harvest_data()
-        for key in d.lines.keys():
+        try:
+            # Coverage 4.0: _harvest_data has been renamed to get_data, the
+            # lines dict is private
+            cov.get_data()
+        except AttributeError:
+            # Coverage < 4.0
+            cov._harvest_data()
+            lines = cov.data.lines
+        else:
+            lines = cov.data._lines
+
+        for key in lines.keys():
             new_path = os.path.relpath(
                 os.path.realpath(key),
                 os.path.realpath(testing_path))
             new_path = os.path.abspath(
                 os.path.join(rootdir, new_path))
-            d.lines[new_path] = d.lines.pop(key)
+            lines[new_path] = lines.pop(key)
 
     color_print('Saving coverage data in .coverage...', 'green')
     cov.save()
@@ -350,9 +338,10 @@ class raises(object):
         def test_foo():
             x = 1/0
 
-    This can also be used a context manager, in which case it is just an alias
-    for the `pytest.raises` context manager (because the two have the same name
-    this help avoid confusion by being flexible).
+    This can also be used a context manager, in which case it is just
+    an alias for the ``pytest.raises`` context manager (because the
+    two have the same name this help avoid confusion by being
+    flexible).
     """
 
     # pep-8 naming exception -- this is a decorator class
@@ -381,7 +370,6 @@ def enable_deprecations_as_exceptions(include_astropy_deprecations=True):
     """
     Turn on the feature that turns deprecations into exceptions.
     """
-
     global _deprecations_as_exceptions
     _deprecations_as_exceptions = True
 
@@ -399,9 +387,6 @@ def treat_deprecations_as_exceptions():
     This completely resets the warning filters and any "already seen"
     warning state.
     """
-    if not _deprecations_as_exceptions:
-        return
-
     # First, totally reset the warning state
     for module in list(six.itervalues(sys.modules)):
         # We don't want to deal with six.MovedModules, only "real"
@@ -409,6 +394,9 @@ def treat_deprecations_as_exceptions():
         if (isinstance(module, types.ModuleType) and
             hasattr(module, '__warningregistry__')):
             del module.__warningregistry__
+
+    if not _deprecations_as_exceptions:
+        return
 
     warnings.resetwarnings()
 
@@ -444,7 +432,7 @@ def treat_deprecations_as_exceptions():
         # py.test's warning.showwarning does not include the line argument
         # on Python 2.6, so we need to explicitly ignore this warning.
         warnings.filterwarnings(
-            "always",
+            "ignore",
             r"functions overriding warnings\.showwarning\(\) must support "
             r"the 'line' argument",
             DeprecationWarning)
@@ -453,8 +441,30 @@ def treat_deprecations_as_exceptions():
         # py.test reads files with the 'U' flag, which is now
         # deprecated in Python 3.4.
         warnings.filterwarnings(
-            "always",
+            "ignore",
             r"'U' mode is deprecated",
+            DeprecationWarning)
+
+        # BeautifulSoup4 triggers a DeprecationWarning in stdlib's
+        # html module.x
+        warnings.filterwarnings(
+            "ignore",
+            r"The strict argument and mode are deprecated\.",
+            DeprecationWarning)
+        warnings.filterwarnings(
+            "ignore",
+            r"The value of convert_charrefs will become True in 3\.5\. "
+            r"You are encouraged to set the value explicitly\.",
+            DeprecationWarning)
+
+    if sys.version_info[:2] >= (3, 5):
+        # py.test raises this warning on Python 3.5.
+        # This can be removed when fixed in py.test.
+        # See https://github.com/pytest-dev/pytest/pull/1009
+        warnings.filterwarnings(
+            "ignore",
+            r"inspect\.getargspec\(\) is deprecated, use "
+            r"inspect\.signature\(\) instead",
             DeprecationWarning)
 
 
@@ -467,7 +477,7 @@ class catch_warnings(warnings.catch_warnings):
     This completely blitzes any memory of any warnings that have
     appeared before so that all warnings will be caught and displayed.
 
-    *args is a set of warning classes to collect.  If no arguments are
+    ``*args`` is a set of warning classes to collect.  If no arguments are
     provided, all warnings are collected.
 
     Use as follows::
@@ -499,7 +509,7 @@ def assert_follows_unicode_guidelines(
         x, roundtrip=None):
     """
     Test that an object follows our Unicode policy.  See
-    "Unicode Policy" in the coding guidelines.
+    "Unicode guidelines" in the coding guidelines.
 
     Parameters
     ----------
@@ -602,3 +612,63 @@ def check_pickling_recovery(original, protocol):
     class_history = [original.__class__]
     generic_recursive_equality_test(original, unpickled,
                                     class_history)
+
+
+def assert_quantity_allclose(actual, desired, rtol=1.e-7, atol=None,
+                             **kwargs):
+    """
+    Raise an assertion if two objects are not equal up to desired tolerance.
+
+    This is a :class:`~astropy.units.Quantity`-aware version of
+    :func:`numpy.testing.assert_allclose`.
+    """
+    import numpy as np
+    np.testing.assert_allclose(*_unquantify_allclose_arguments(actual, desired,
+                                                               rtol, atol),
+                               **kwargs)
+
+
+def quantity_allclose(a, b, rtol=1.e-5, atol=None, **kwargs):
+    """
+    Returns True if two arrays are element-wise equal within a tolerance.
+
+    This is a :class:`~astropy.units.Quantity`-aware version of
+    :func:`numpy.allclose`.
+    """
+    import numpy as np
+    return np.allclose(*_unquantify_allclose_arguments(a, b, rtol, atol),
+                       **kwargs)
+
+
+def _unquantify_allclose_arguments(actual, desired, rtol, atol):
+    from .. import units as u
+
+    actual = u.Quantity(actual, subok=True, copy=False)
+
+    desired = u.Quantity(desired, subok=True, copy=False)
+    try:
+        desired = desired.to(actual.unit)
+    except u.UnitsError:
+        raise u.UnitsError("Units for 'desired' ({0}) and 'actual' ({1}) "
+                           "are not convertible"
+                           .format(desired.unit, actual.unit))
+
+    if atol is None:
+        # by default, we assume an absolute tolerance of 0
+        atol = u.Quantity(0)
+    else:
+        atol = u.Quantity(atol, subok=True, copy=False)
+        try:
+            atol = atol.to(actual.unit)
+        except u.UnitsError:
+            raise u.UnitsError("Units for 'atol' ({0}) and 'actual' ({1}) "
+                               "are not convertible"
+                               .format(atol.unit, actual.unit))
+
+    rtol =  u.Quantity(rtol, subok=True, copy=False)
+    try:
+        rtol = rtol.to(u.dimensionless_unscaled)
+    except:
+        raise u.UnitsError("`rtol` should be dimensionless")
+
+    return actual.value, desired.value, rtol.value, atol.value

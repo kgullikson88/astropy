@@ -2,6 +2,8 @@
 
 from __future__ import print_function
 
+import os
+
 import numpy as np
 
 from ....tests.helper import pytest, catch_warnings
@@ -413,3 +415,5 @@ def test_read_h5py_objects(tmpdir):
 
     t4 = Table.read(f['the_table'])
     assert np.all(t4['a'] == [1, 2, 3])
+
+    f.close()         # don't raise an error in 'test --open-files'

@@ -13,11 +13,11 @@ import decimal
 import numpy as np
 from numpy.testing import (assert_allclose, assert_array_equal,
                            assert_array_almost_equal)
-from distutils import version
-NUMPY_VERSION = version.LooseVersion(np.__version__)
+
 
 from ...tests.helper import raises, pytest
-from ...utils import isiterable
+from ...utils import isiterable, minversion
+from ...utils.compat import NUMPY_LT_1_7
 from ... import units as u
 from ...units.quantity import _UNIT_NOT_INITIALISED
 from ...extern.six.moves import xrange
@@ -181,6 +181,40 @@ class TestQuantityCreation(object):
         # check it works also when passing in a quantity
         q3 = u.Quantity(q1, u.m, ndmin=3)
         assert q3.ndim == 3 and q3.shape == (1, 1, 10)
+
+    def test_non_quantity_with_unit(self):
+        """Test that unit attributes in objects get recognized."""
+        class MyQuantityLookalike(np.ndarray):
+            pass
+
+        a = np.arange(3.)
+        mylookalike = a.copy().view(MyQuantityLookalike)
+        mylookalike.unit = 'm'
+        q1 = u.Quantity(mylookalike)
+        assert isinstance(q1, u.Quantity)
+        assert q1.unit is u.m
+        assert np.all(q1.value == a)
+
+        q2 = u.Quantity(mylookalike, u.mm)
+        assert q2.unit is u.mm
+        assert np.all(q2.value == 1000.*a)
+
+        q3 = u.Quantity(mylookalike, copy=False)
+        assert np.all(q3.value == mylookalike)
+        q3[2] = 0
+        assert q3[2] == 0.
+        assert mylookalike[2] == 0.
+
+        mylookalike = a.copy().view(MyQuantityLookalike)
+        mylookalike.unit = u.m
+        q4 = u.Quantity(mylookalike, u.mm, copy=False)
+        q4[2] = 0
+        assert q4[2] == 0.
+        assert mylookalike[2] == 2.
+
+        mylookalike.unit = 'nonsense'
+        with pytest.raises(TypeError):
+            u.Quantity(mylookalike)
 
 
 class TestQuantityOperations(object):
@@ -432,8 +466,12 @@ class TestQuantityOperations(object):
                 long(q1)
             assert exc.value.args[0] == converter_err_msg
 
+        # We used to test `q1 * ['a', 'b', 'c'] here, but that that worked
+        # at all was a really odd confluence of bugs.  Since it doesn't work
+        # in numpy >=1.10 any more, just go directly for `__index__` (which
+        # makes the test more similar to the `int`, `long`, etc., tests).
         with pytest.raises(TypeError) as exc:
-            q1 * ['a', 'b', 'c']
+            q1.__index__()
         assert exc.value.args[0] == index_err_msg
 
         # dimensionless but scaled is OK, however
@@ -446,7 +484,7 @@ class TestQuantityOperations(object):
             assert long(q2) == long(q2.to(u.dimensionless_unscaled).value)
 
         with pytest.raises(TypeError) as exc:
-            q2 * ['a', 'b', 'c']
+            q2.__index__()
         assert exc.value.args[0] == index_err_msg
 
         # dimensionless unscaled is OK, though for index needs to be int
@@ -458,7 +496,7 @@ class TestQuantityOperations(object):
             assert long(q3) == 1
 
         with pytest.raises(TypeError) as exc:
-            q1 * ['a', 'b', 'c']
+            q1.__index__()
         assert exc.value.args[0] == index_err_msg
 
         # integer dimensionless unscaled is good for all
@@ -469,7 +507,7 @@ class TestQuantityOperations(object):
         if six.PY2:
             assert long(q4) == 2
 
-        assert q4 * ['a', 'b', 'c'] == ['a', 'b', 'c', 'a', 'b', 'c']
+        assert q4.__index__() == 2
 
         # but arrays are not OK
         q5 = u.Quantity([1, 2], u.m)
@@ -487,7 +525,7 @@ class TestQuantityOperations(object):
             assert exc.value.args[0] == converter_err_msg
 
         with pytest.raises(TypeError) as exc:
-            q5 * ['a', 'b', 'c']
+            q5.__index__()
         assert exc.value.args[0] == index_err_msg
 
     def test_array_converters(self):
@@ -667,13 +705,62 @@ class TestQuantityDisplay(object):
         assert repr(bad_quantity).endswith(_UNIT_NOT_INITIALISED + '>')
 
     def test_repr_latex(self):
-        q2 = u.Quantity(1.5e14, 'm/s')
+        from ...units.quantity import conf
+
+        q2scalar = u.Quantity(1.5e14, 'm/s')
         assert self.scalarintq._repr_latex_() == '$1 \\; \\mathrm{m}$'
         assert self.scalarfloatq._repr_latex_() == '$1.3 \\; \\mathrm{m}$'
-        assert (q2._repr_latex_() ==
-                '$1.5\\times 10^{+14} \\; \\mathrm{\\frac{m}{s}}$')
-        with pytest.raises(NotImplementedError):
-            self.arrq._repr_latex_()
+        assert (q2scalar._repr_latex_() ==
+                '$1.5 \\times 10^{14} \\; \\mathrm{\\frac{m}{s}}$')
+
+        if NUMPY_LT_1_7:
+            with pytest.raises(NotImplementedError):
+                self.arrq._repr_latex_()
+            return  # all arrays should fail
+
+        assert self.arrq._repr_latex_() == '$[1,~2.3,~8.9] \; \mathrm{m}$'
+
+        qmed = np.arange(100)*u.m
+        qbig = np.arange(1000)*u.m
+        qvbig = np.arange(10000)*1e9*u.m
+
+        pops = np.get_printoptions()
+        oldlat = conf.latex_array_threshold
+        try:
+            #check thresholding behavior
+            conf.latex_array_threshold = 100  # should be default
+            lsmed = qmed._repr_latex_()
+            assert r'\dots' not in lsmed
+            lsbig = qbig._repr_latex_()
+            assert r'\dots' in lsbig
+            lsvbig = qvbig._repr_latex_()
+            assert r'\dots' in lsvbig
+
+            conf.latex_array_threshold = 1001
+            lsmed = qmed._repr_latex_()
+            assert r'\dots' not in lsmed
+            lsbig = qbig._repr_latex_()
+            assert r'\dots' not in lsbig
+            lsvbig = qvbig._repr_latex_()
+            assert r'\dots' in lsvbig
+
+
+            conf.latex_array_threshold = -1  # means use the numpy threshold
+            np.set_printoptions(threshold=99)
+            lsmed = qmed._repr_latex_()
+            assert r'\dots' in lsmed
+            lsbig = qbig._repr_latex_()
+            assert r'\dots' in lsbig
+            lsvbig = qvbig._repr_latex_()
+            assert r'\dots' in lsvbig
+        finally:
+            # prevent side-effects from influencing other tests
+            np.set_printoptions(**pops)
+            conf.latex_array_threshold = oldlat
+
+        qinfnan = [np.inf, -np.inf, np.nan] * u.m
+        assert qinfnan._repr_latex_() == r'$[\infty,~-\infty,~{\rm NaN}] \; \mathrm{m}$'
+
 
 
 def test_decompose():
@@ -741,7 +828,7 @@ def test_arrays():
     assert qkpc0.value == a[0].item()
     assert qkpc0.unit == qkpc.unit
     assert isinstance(qkpc0, u.Quantity)
-    assert not qkpc0.isscalar
+    assert qkpc0.isscalar
     qkpcx = qkpc['x']
     assert np.all(qkpcx.value == a['x'])
     assert qkpcx.unit == qkpc.unit
@@ -912,9 +999,6 @@ def test_copy():
     assert q1.dtype == q2.dtype
     assert q1.value is not q2.value
 
-    if NUMPY_VERSION < version.LooseVersion('1.6.0'):
-        return  # numpy 1.5 doesn't allow arguments to `copy`
-
     q3 = q1.copy(order='F')
     assert q3.flags['F_CONTIGUOUS']
     assert np.all(q1.value == q3.value)
@@ -1052,7 +1136,7 @@ def test_insert():
     assert q2.unit is u.m
     assert q2.dtype.kind == 'f'
 
-    if NUMPY_VERSION >= version.LooseVersion('1.8.0'):
+    if minversion(np, '1.8.0'):
         q2 = q.insert(1, [1, 2] * u.km)
         assert np.all(q2.value == [1, 1000, 2000, 2])
         assert q2.unit is u.m
@@ -1075,3 +1159,23 @@ def test_insert():
     q2 = q.insert(1, 10 * u.m, axis=1)
     assert np.all(q2.value == [[  1,  10, 2],
                                [  3,  10, 4]])
+
+
+def test_repr_array_of_quantity():
+    """
+    Test print/repr of object arrays of Quantity objects with different
+    units.
+
+    Regression test for the issue first reported in
+    https://github.com/astropy/astropy/issues/3777
+    """
+
+    a = np.array([1 * u.m, 2 * u.s], dtype=object)
+    if NUMPY_LT_1_7:
+        # Numpy 1.6.x has some different defaults for how to display object
+        # arrays (it uses the str() of the objects instead of the repr()
+        assert repr(a) == 'array([1.0 m, 2.0 s], dtype=object)'
+        assert str(a) == '[1.0 m 2.0 s]'
+    else:
+        assert repr(a) == 'array([<Quantity 1.0 m>, <Quantity 2.0 s>], dtype=object)'
+        assert str(a) == '[<Quantity 1.0 m> <Quantity 2.0 s>]'

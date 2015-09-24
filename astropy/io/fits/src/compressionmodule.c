@@ -225,7 +225,15 @@ int compress_type_from_string(char* zcmptype) {
         return PLIO_1;
     } else if (0 == strcmp(zcmptype, "HCOMPRESS_1")) {
         return HCOMPRESS_1;
-    } else {
+    }
+#ifdef CFITSIO_SUPPORTS_SUBTRACTIVE_DITHER_2
+    /* CFITSIO adds a compression type alias for RICE_1 compression
+       as a flag for using subtractive_dither_2 */
+    else if (0 == strcmp(zcmptype, "RICE_ONE")) {
+        return RICE_1;
+    }
+#endif
+    else {
         PyErr_Format(PyExc_ValueError, "Unrecognized compression type: %s",
                      zcmptype);
         return -1;
@@ -395,23 +403,6 @@ int get_header_longlong(PyObject* header, char* keyword, long long* val,
 }
 
 
-void* compression_realloc(void* ptr, size_t size) {
-    // This realloc()-like function actually just mallocs the requested
-    // size and copies from the original memory address into the new one, and
-    // returns the newly malloc'd address.
-    // This is generally less efficient than an actual realloc(), but the
-    // problem with using realloc in this case is that when it succeeds it will
-    // free() the original memory, which may still be in use by the ndarray
-    // using that memory as its data buffer.  This seems like the least hacky
-    // way around that for now.
-    // I'm open to other ideas though.
-    void* tmp;
-    tmp = malloc(size);
-    memcpy(tmp, ptr, size);
-    return tmp;
-}
-
-
 void tcolumns_from_header(fitsfile* fileptr, PyObject* header,
                           tcolumn** columns) {
     // Creates the array of tcolumn structures from the table column keywords
@@ -433,7 +424,10 @@ void tcolumns_from_header(fitsfile* fileptr, PyObject* header,
 
     get_header_int(header, "TFIELDS", &tfields, 0);
 
-    *columns = column = PyMem_New(tcolumn, (size_t) tfields);
+    // This used to use PyMem_New, but don't do that; CFITSIO will later
+    // free() this object when the file is closed, so just use malloc here
+    // *columns = column = PyMem_New(tcolumn, (size_t) tfields);
+    *columns = column = calloc((size_t) tfields, sizeof(tcolumn));
     if (column == NULL) {
         return;
     }
@@ -590,6 +584,7 @@ void configure_compression(fitsfile* fileptr, PyObject* header) {
         znaxis = MAX_COMPRESS_DIM;
     }
 
+    Fptr->tilerow = NULL;
     Fptr->maxtilelen = 1;
     for (idx = 1; idx <= znaxis; idx++) {
         snprintf(keyword, 9, "ZNAXIS%u", idx);
@@ -815,7 +810,7 @@ fail:
 
 
 void open_from_hdu(fitsfile** fileptr, void** buf, size_t* bufsize,
-                   PyObject* hdu, tcolumn** columns) {
+                   PyObject* hdu, tcolumn** columns, int mode) {
     PyObject* header = NULL;
     FITSfile* Fptr;
 
@@ -851,6 +846,7 @@ void open_from_hdu(fitsfile** fileptr, void** buf, size_t* bufsize,
     Fptr = (*fileptr)->Fptr;
 
     // Now we have some fun munging some of the elements in the fitsfile struct
+    Fptr->writemode = mode;
     Fptr->open_count = 1;
     Fptr->hdutype = BINARY_TBL;  /* This is a binary table HDU */
     Fptr->lasthdu = 1;
@@ -921,7 +917,7 @@ PyObject* compression_compress_hdu(PyObject* self, PyObject* args)
         return NULL;
     }
 
-    open_from_hdu(&fileptr, &outbuf, &outbufsize, hdu, &columns);
+    open_from_hdu(&fileptr, &outbuf, &outbufsize, hdu, &columns, READWRITE);
     if (PyErr_Occurred()) {
         goto fail;
     }
@@ -1018,7 +1014,7 @@ PyObject* compression_decompress_hdu(PyObject* self, PyObject* args)
     long arrsize;
     unsigned int idx;
 
-    fitsfile* fileptr;
+    fitsfile* fileptr = NULL;
     int anynul = 0;
     int status = 0;
 
@@ -1040,7 +1036,7 @@ PyObject* compression_decompress_hdu(PyObject* self, PyObject* args)
         return Py_None;
     }
 
-    open_from_hdu(&fileptr, &inbuf, &inbufsize, hdu, &columns);
+    open_from_hdu(&fileptr, &inbuf, &inbufsize, hdu, &columns, READONLY);
     if (PyErr_Occurred()) {
         return NULL;
     }
@@ -1070,10 +1066,15 @@ PyObject* compression_decompress_hdu(PyObject* self, PyObject* args)
     }
 
 fail:
+    // CFITSIO will free this object in the ffchdu function by way of
+    // fits_close_file; we need to let CFITSIO handle this so that it also
+    // cleans up the compressed tile cache
+    /*
     if (columns != NULL) {
         PyMem_Free(columns);
         fileptr->Fptr->tableptr = NULL;
     }
+    */
 
     if (fileptr != NULL) {
         status = 1;// Disable header-related errors

@@ -5,7 +5,6 @@ import os
 import math
 import multiprocessing
 import mmap
-from distutils import version
 
 import numpy as np
 cimport numpy as np
@@ -65,6 +64,9 @@ cdef extern from "src/tokenizer.h":
         int strip_whitespace_lines  # whether to strip whitespace at the beginning and end of lines
         int strip_whitespace_fields # whether to strip whitespace at the beginning and end of fields
         int use_fast_converter      # whether to use the fast converter for floats
+        char *comment_lines    # single null-delimited string containing comment lines
+        int comment_lines_len  # length of comment_lines in memory
+        int comment_pos        # current index in comment_lines
         # Example input/output
         # --------------------
         # source: "A,B,C\n10,5.,6\n1,2,3"
@@ -88,6 +90,7 @@ cdef extern from "src/tokenizer.h":
     void start_iteration(tokenizer_t *self, int col)
     char *next_field(tokenizer_t *self, int *size)
     char *get_line(char *ptr, int *len, int map_len)
+    void reset_comments(tokenizer_t *self)
 
 cdef extern from "Python.h":
     int PyObject_AsReadBuffer(object obj, const void **buffer, Py_ssize_t *buffer_len)
@@ -121,11 +124,11 @@ cdef class FileString:
         self.fhandle = open(fname, 'r')
         if not self.fhandle:
             raise IOError('File "{0}" could not be opened'.format(fname))
-        self.mmap = mmap.mmap(self.fhandle.fileno(), 0, prot=mmap.PROT_READ)
+        self.mmap = mmap.mmap(self.fhandle.fileno(), 0, access=mmap.ACCESS_READ)
         cdef Py_ssize_t buf_len = len(self.mmap)
         if six.PY2:
             PyObject_AsReadBuffer(self.mmap, &self.mmap_ptr, &buf_len)
-        else:            
+        else:
             PyObject_GetBuffer(self.mmap, &self.buf, PyBUF_SIMPLE)
             self.mmap_ptr = self.buf.buf
 
@@ -368,7 +371,7 @@ cdef class CParser:
         if tokenize(self.tokenizer, data_end, 0, len(self.names)) != 0:
             self.raise_error("an error occurred while parsing table data")
         elif self.tokenizer.num_rows == 0: # no data
-            return [np.array([], dtype=np.int_)] * self.width
+            return ([np.array([], dtype=np.int_)] * self.width, [])
         self._set_fill_values()
         cdef int num_rows = self.tokenizer.num_rows
         if self.data_end is not None and self.data_end < 0: # negative indexing
@@ -384,12 +387,18 @@ cdef class CParser:
             self.raise_error("an error occurred while advancing to the first "
                              "line of data")
 
+        cdef list line_comments = self._get_comments(self.tokenizer)
         cdef int N = self.parallel
-        queue = multiprocessing.Queue()
+        try:
+            queue = multiprocessing.Queue()
+        except (ImportError, NotImplementedError, AttributeError, OSError):
+            self.raise_error("shared semaphore implementation required "
+                             "but not available")
         cdef int offset = self.tokenizer.source_pos
 
         if offset == source_len: # no data
-            return dict((name, np.array([], dtype=np.int_)) for name in self.names)
+            return (dict((name, np.array([], dtype=np.int_)) for name in
+                         self.names), [])
 
         cdef int chunksize = math.ceil((source_len - offset) / float(N))
         cdef list chunkindices = [offset]
@@ -419,17 +428,22 @@ cdef class CParser:
             process.start()
 
         cdef list chunks = [None] * N
+        cdef list comments_chunks = [None] * N
         cdef dict failed_procs = {}
 
         for i in range(N):
-            data, err, proc = queue.get()
+            queue_ret, err, proc = queue.get()
             if isinstance(err, Exception):
                 for process in processes:
                     process.terminate()
                 raise err
             elif err is not None: # err is (error code, error line)
                 failed_procs[proc] = err
+            comments, data = queue_ret
+            comments_chunks[proc] = comments
             chunks[proc] = data
+        for chunk in comments_chunks:
+            line_comments.extend(chunk)
 
         if failed_procs:
             # find the line number of the error
@@ -466,7 +480,7 @@ cdef class CParser:
                 reconvert_cols.append(i)
 
         reconvert_queue.put(reconvert_cols)
-        for process in processes:            
+        for process in processes:
             process.join() # wait for each process to finish
         try:
             while True:
@@ -510,7 +524,7 @@ cdef class CParser:
         for process in processes:
             process.terminate()
 
-        return ret
+        return ret, line_comments
 
     cdef _set_fill_values(self):
         if self.fill_names is None:
@@ -520,6 +534,19 @@ cdef class CParser:
             if self.fill_exclude_names is not None:
                 self.fill_names.difference_update(self.fill_exclude_names)
         self.fill_values, self.fill_empty = get_fill_values(self.fill_values)
+
+    cdef _get_comments(self, tokenizer_t *t):
+        line_comments = []
+        comment = ''
+        for i in range(t.comment_pos):
+            c = t.comment_lines[i] # next char in comment string
+            if not c: # zero byte -- line terminator
+                # replace empty placeholder with ''
+                line_comments.append(comment.replace('\x01', '').strip())
+                comment = ''
+            else:
+                comment += chr(c)
+        return line_comments
 
     cdef _convert_data(self, tokenizer_t *t, try_int, try_float, try_string, num_rows):
         cols = {}
@@ -542,7 +569,7 @@ cdef class CParser:
                         raise ValueError('Column {0} failed to convert'.format(name))
                     cols[name] = self._convert_str(t, i, num_rows)
 
-        return cols
+        return cols, self._get_comments(t)
 
     cdef np.ndarray _convert_int(self, tokenizer_t *t, int i, int nrows):
         cdef int num_rows = t.num_rows
@@ -574,7 +601,7 @@ cdef class CParser:
                 replace_info = self.fill_values[field]
 
             if replace_info is not None:
-                # Either this column applies to the field as specified in the 
+                # Either this column applies to the field as specified in the
                 # fill_values parameter, or no specific columns are specified
                 # and this column should apply fill_values.
                 if (len(replace_info) > 1 and self.names[i] in replace_info[1:]) \
@@ -649,13 +676,7 @@ cdef class CParser:
                 raise ValueError()
             elif t.code == OVERFLOW_ERROR:
                 t.code = NO_ERROR
-                # In numpy < 1.6, using type inference yields a float for 
-                # overflow values because the error raised is not specific.
-                # This replicates the old reading behavior (see #2234).
-                if version.LooseVersion(np.__version__) < version.LooseVersion('1.6'):
-                    col[row] = new_value if replacing else field
-                else:
-                    raise ValueError()
+                raise ValueError()
             else:
                 data[row] = converted
             row += 1
@@ -756,6 +777,7 @@ def _read_chunk(CParser self, start, end, try_int,
     cdef tokenizer_t *chunk_tokenizer = self.tokenizer
     chunk_tokenizer.source_len = end
     chunk_tokenizer.source_pos = start
+    reset_comments(chunk_tokenizer)
 
     data = None
     err = None
@@ -764,9 +786,10 @@ def _read_chunk(CParser self, start, end, try_int,
         err = (chunk_tokenizer.code, chunk_tokenizer.num_rows)
     if chunk_tokenizer.num_rows == 0: # no data
         data = dict((name, np.array([], np.int_)) for name in self.get_names())
+        line_comments = self._get_comments(chunk_tokenizer)
     else:
         try:
-            data = self._convert_data(chunk_tokenizer,
+            data, line_comments = self._convert_data(chunk_tokenizer,
                                       try_int, try_float, try_string, -1)
         except Exception as e:
             delete_tokenizer(chunk_tokenizer)
@@ -774,7 +797,7 @@ def _read_chunk(CParser self, start, end, try_int,
             return
 
     try:
-        queue.put((data, err, i))
+        queue.put(((line_comments, data), err, i))
     except Queue.Full as e:
         # hopefully this shouldn't happen
         delete_tokenizer(chunk_tokenizer)
@@ -801,6 +824,7 @@ cdef class FastWriter:
         list formats
         list format_funcs
         list types
+        list line_comments
         str quotechar
         str delimiter
         int strip_whitespace
@@ -871,6 +895,7 @@ cdef class FastWriter:
         self.col_iters = []
         self.formats = []
         self.format_funcs = []
+        self.line_comments = table.meta.get('comments', [])
 
         for col in six.itervalues(table.columns):
             if col.name in self.use_names: # iterate over included columns
@@ -892,13 +917,22 @@ cdef class FastWriter:
         self.types = ['S' if self.table[name].dtype.kind in ('S', 'U') else 'N'
                       for name in self.use_names]
 
-    def _write_header(self, output, writer, header_output, output_types):
-        if header_output is not None:
-            if header_output == 'comment':
-                output.write(self.comment)
-            writer.writerow([x.strip() for x in self.use_names] if 
-                            self.strip_whitespace else self.use_names)
+    cdef _write_comments(self, output):
+        if self.comment is not False:
+            for comment_line in self.line_comments:
+                output.write(self.comment + comment_line + '\n')
 
+    def _write_header(self, output, writer, header_output, output_types):
+        if header_output is not None and header_output == 'comment':
+            output.write(self.comment)
+            writer.writerow([x.strip() for x in self.use_names] if
+                            self.strip_whitespace else self.use_names)
+            self._write_comments(output)
+        else:
+            self._write_comments(output)
+            if header_output is not None:
+                writer.writerow([x.strip() for x in self.use_names] if
+                            self.strip_whitespace else self.use_names)
         if output_types:
             writer.writerow(self.types)
 
@@ -916,7 +950,7 @@ cdef class FastWriter:
                             quoting=csv.QUOTE_MINIMAL,
                             lineterminator=os.linesep)
         self._write_header(output, writer, header_output, output_types)
-                                         
+
         # Split rows into N-sized chunks, since we don't want to
         # store all the rows in memory at one time (inefficient)
         # or fail to take advantage of the speed boost of writerows()
@@ -925,7 +959,7 @@ cdef class FastWriter:
         cdef int num_cols = len(self.use_names)
         cdef int num_rows = len(self.table)
         # cache string columns beforehand
-        cdef set string_rows = set([i for i, type in enumerate(self.types) if 
+        cdef set string_rows = set([i for i, type in enumerate(self.types) if
                                     type == 'S'])
         cdef list rows = [[None] * num_cols for i in range(N)]
 

@@ -20,9 +20,9 @@ conf = Conf()
 
 from .column import Column, MaskedColumn
 from .groups import TableGroups, ColumnGroups
-from .table import Table, TableColumns, Row, TableFormatter
-from .np_utils import TableMergeError
-from .operations import join, hstack, vstack
+from .table import Table, QTable, TableColumns, Row, TableFormatter, NdarrayMixin
+from .operations import join, hstack, vstack, unique, TableMergeError
+from .jsviewer import JSViewer
 
 # Import routines that connect readers/writers to astropy.table
 from ..io.ascii import connect

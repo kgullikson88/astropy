@@ -4,12 +4,6 @@
 """
 This package defines the astrophysics-specific units.  They are also
 available in the `astropy.units` namespace.
-
-The ``mag`` unit is provided for compatibility with the FITS unit string
-standard.  However, it is not very useful as-is since it is "orphaned"
-and can not be converted to any other unit.  A future astropy
-magnitudes library is planned to address this shortcoming.
-
 """
 
 from __future__ import (absolute_import, division, print_function,
@@ -26,7 +20,7 @@ _ns = globals()
 ###########################################################################
 # LENGTH
 
-def_unit((['AU', 'au'], []), _si.au.value * si.m, namespace=_ns, prefixes=True,
+def_unit((['AU', 'au'], ['astronomical_unit']), _si.au.value * si.m, namespace=_ns, prefixes=True,
          doc="astronomical unit: approximately the mean Earth--Sun "
          "distance.")
 
@@ -43,7 +37,7 @@ def_unit(['lyr', 'lightyear'], _si.c.value * si.yr.to(si.s) * si.m,
 ###########################################################################
 # AREAS
 
-def_unit(['barn'], 10 ** -28 * si.m ** 2, namespace=_ns, prefixes=True,
+def_unit(['barn', 'barn'], 10 ** -28 * si.m ** 2, namespace=_ns, prefixes=True,
          doc="barn: unit of area used in HEP")
 
 
@@ -146,18 +140,6 @@ def_unit(['beam'], namespace=_ns, prefixes=True)
 def_unit(['electron'], doc="Number of electrons", namespace=_ns,
          format={'latex': r'e^{-}', 'unicode': 'e⁻'})
 
-###########################################################################
-# Logarithmic units
-
-def_unit(['dex'], namespace=_ns, prefixes=False,
-         doc="Dex: Base 10 logarithmic unit")
-
-def_unit(['dB', 'decibel'], 0.1 * dex, namespace=_ns, prefixes=False,
-         doc="Decibel: ten per base 10 logarithmic unit")
-
-def_unit(['mag'], -0.4 * dex, namespace=_ns, prefixes=True,
-         doc="Astronomical magnitude: -2.5 per base 10 logarithmic unit")
-
 
 ###########################################################################
 # CLEANUP
@@ -173,4 +155,5 @@ del si
 # This generates a docstring for this module that describes all of the
 # standard units defined here.
 from .utils import generate_unit_summary as _generate_unit_summary
-__doc__ += _generate_unit_summary(globals())
+if __doc__ is not None:
+    __doc__ += _generate_unit_summary(globals())

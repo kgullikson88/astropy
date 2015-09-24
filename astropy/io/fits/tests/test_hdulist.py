@@ -1,3 +1,4 @@
+
 # Licensed under a 3-clause BSD style license - see PYFITS.rst
 
 import glob
@@ -61,7 +62,6 @@ class TestHDUListFunctions(FitsTestCase):
     def test_create_from_multiple_primary(self):
         """
         Regression test for https://aeon.stsci.edu/ssb/trac/pyfits/ticket/145
-
         Ensure that a validation error occurs when saving an HDUList containing
         multiple PrimaryHDUs.
         """
@@ -436,7 +436,6 @@ class TestHDUListFunctions(FitsTestCase):
 
     def test_new_hdulist_extend_keyword(self):
         """Regression test for https://aeon.stsci.edu/ssb/trac/pyfits/ticket/114
-
         Tests that adding a PrimaryHDU to a new HDUList object updates the
         EXTEND keyword on that HDU.
         """
@@ -463,7 +462,6 @@ class TestHDUListFunctions(FitsTestCase):
 
     def test_open_file_with_end_padding(self):
         """Regression test for https://aeon.stsci.edu/ssb/trac/pyfits/ticket/106
-
         Open files with end padding bytes.
         """
 
@@ -481,7 +479,6 @@ class TestHDUListFunctions(FitsTestCase):
     def test_open_file_with_bad_header_padding(self):
         """
         Regression test for https://aeon.stsci.edu/ssb/trac/pyfits/ticket/136
-
         Open files with nulls for header block padding instead of spaces.
         """
 
@@ -509,7 +506,6 @@ class TestHDUListFunctions(FitsTestCase):
     def test_update_with_truncated_header(self):
         """
         Regression test for https://aeon.stsci.edu/ssb/trac/pyfits/ticket/148
-
         Test that saving an update where the header is shorter than the
         original header doesn't leave a stump from the old header in the file.
         """
@@ -569,7 +565,6 @@ class TestHDUListFunctions(FitsTestCase):
     def test_update_resized_header2(self):
         """
         Regression test for https://aeon.stsci.edu/ssb/trac/pyfits/ticket/150
-
         This is similar to test_update_resized_header, but specifically tests a
         case of multiple consecutive flush() calls on the same HDUList object,
         where each flush() requires a resize.
@@ -653,7 +648,6 @@ class TestHDUListFunctions(FitsTestCase):
 
     def test_save_backup(self):
         """Test for https://aeon.stsci.edu/ssb/trac/pyfits/ticket/121
-
         Save backup of file before flushing changes.
         """
 
@@ -688,7 +682,6 @@ class TestHDUListFunctions(FitsTestCase):
     def test_replace_mmap_data(self):
         """Regression test for
         https://github.com/spacetelescope/PyFITS/issues/25
-
         Replacing the mmap'd data of one file with mmap'd data from a
         different file should work.
         """
@@ -726,7 +719,6 @@ class TestHDUListFunctions(FitsTestCase):
     def test_replace_mmap_data_2(self):
         """Regression test for
         https://github.com/spacetelescope/PyFITS/issues/25
-
         Replacing the mmap'd data of one file with mmap'd data from a
         different file should work.  Like test_replace_mmap_data but with
         table data instead of image data.
@@ -767,8 +759,10 @@ class TestHDUListFunctions(FitsTestCase):
 
     def test_extname_in_hdulist(self):
         """
-        Tests to make sure that the 'in' operator works for hdulist's
+        Tests to make sure that the 'in' operator works.
+        Regression test for https://github.com/astropy/astropy/issues/3060
         """
+
         hdulist = fits.HDUList()
         hdulist.append(fits.ImageHDU(name='a'))
 

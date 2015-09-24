@@ -14,7 +14,7 @@ You can control the way that |quantity| and |unit| objects are rendered as
 strings using the new `Format String Syntax
 <http://docs.python.org/library/string.html#format-string-syntax>`__.
 New-style format strings use the ``"{}".format()`` syntax.  Most of
-the format speficiers are simliar to the old ``%``-style formatting,
+the format specifiers are similar to the old ``%``-style formatting,
 so things like ``0.003f`` still work, just in the form
 ``"{:0.003f}".format()``.
 
@@ -198,8 +198,7 @@ Normally, passing an unrecognized unit string raises an exception::
     ...
   ValueError: 'Angstroem' did not parse as fits unit: At col 0, Unit
   'Angstroem' not supported by the FITS standard. Did you mean
-  Angstrom (deprecated), angstrom (deprecated) or nm (with data
-  multiplied by 0.1)?
+  10**-1 nm, Angstrom (deprecated) or angstrom (deprecated)?
 
 However, the `~astropy.units.Unit` constructor has the keyword
 argument ``parse_strict`` that can take one of three values to control
